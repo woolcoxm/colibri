@@ -867,8 +867,8 @@ static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quant
                           * [2] post-attention del layer L -> routing di L+1 (un residuo MoE e
                           *     un'attention di anticipo: il punto dove il prefetch avrebbe
                           *     un intero giro di disco per lavorare in ombra). */
-static int64_t la_hit[3], la_tot[3];
-static int la_pred[2][130][16]; static signed char la_val[2][130];
+static int64_t la_hit[4], la_tot[4];  /* [0]=prev, [1]=skip-attn, [2]=PILOT, [3]=two-step+top1 */
+static int la_pred[3][130][16]; static signed char la_val[3][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
@@ -1899,7 +1899,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(m->eroute[layer][z]==idxs[kk]){ la_hit[0]++; break; }
             la_tot[0]+=Ke;
         }
-        for(int kind=0;kind<2;kind++) if(la_val[kind][layer]){   /* [1]/[2] vs predizioni */
+        for(int kind=0;kind<3;kind++) if(la_val[kind][layer]){
             for(int kk=0;kk<Ke;kk++) for(int z=0;z<K;z++)
                 if(la_pred[kind][layer][z]==idxs[kk]){ la_hit[1+kind]++; break; }
             la_tot[1+kind]+=Ke; la_val[kind][layer]=0;
@@ -2181,12 +2181,80 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     free(g); free(u);
 }
 
-/* LOOKA: predice il top-K del router del layer `target` dallo stato h (residual stream),
- * usando la STESSA pipeline del routing vero (post_ln -> router -> sigmoid+bias, top-K).
- * kind 0 = stesso layer saltando l'attention, kind 1 = layer successivo. */
+/* LOOKA: predice il top-K del router del layer `target` dallo stato h (residual stream).
+ * kind 0 = stesso layer saltando l'attention
+ * kind 1 = layer successivo (PILOT: stale state, 75.8%)
+ * kind 2 = two-step + top-1: shared expert + top-1 RESIDENT routed expert + router.
+ *   Richer than shared-only: also computes the single highest-scoring routed expert
+ *   IF it's already resident (pin/LRU). If not resident, falls back to shared-only.
+ *   This tests whether adding even one routed expert to the proxy improves recall. */
 static void la_predict(Model *m, int target, const float *h, int kind){
     Cfg *c=&m->c; Layer *l=&m->L[target]; int D=c->hidden, E=c->n_experts, K=c->topk;
     float *nrm=falloc(D), *ch=falloc(E);
+
+    if(kind==2){
+        int src=target-1;
+        if(src<0||src>=c->n_layers||!m->L[src].sparse){ la_val[2][target]=0; free(nrm); free(ch); return; }
+        Layer *sl=&m->L[src]; int sI=c->moe_inter*c->n_shared;
+        /* Normalize with L's post_ln (what moe() does) */
+        float *snrm=falloc(D);
+        rmsnorm(snrm,h,sl->post_ln,D,c->eps);
+        /* Shared expert */
+        float *sg=falloc(sI),*su=falloc(sI);
+        matmul_qt(sg,snrm,&sl->sh_gate,1);
+        matmul_qt(su,snrm,&sl->sh_up,1);
+        for(int i=0;i<sI;i++) sg[i]=siluf(sg[i])*su[i];
+        float *sout=falloc(D);
+        matmul_qt(sout,sg,&sl->sh_down,1);
+        free(sg); free(su);
+        /* Also compute the top-1 routed expert IF it's resident.
+         * Run L's router to find which expert would be selected, then check if it's
+         * in the pin or LRU cache for layer src. If yes, compute its contribution. */
+        float *rlogit=falloc(E);
+        matmul(rlogit,snrm,sl->router,1,D,E);
+        for(int e=0;e<E;e++) rlogit[e]=sigmoidf(rlogit[e])+sl->router_bias[e];
+        int top1=0; for(int e=1;e<E;e++) if(rlogit[e]>rlogit[top1]) top1=e;
+        float top1_w = rlogit[top1];  /* router weight for the top-1 expert */
+        free(rlogit);
+        /* Check residency: is expert `top1` in pin[src] or ecache[src]? */
+        ESlot *resident_slot=NULL;
+        ESlot *P=m->pin[src];
+        for(int z=0;z<m->npin[src]&&!resident_slot;z++) if(P[z].eid==top1) resident_slot=&P[z];
+        if(!resident_slot){
+            ESlot *Sl=m->ecache[src];
+            for(int z=0;z<m->ecn[src]&&!resident_slot;z++) if(Sl[z].eid==top1) resident_slot=&Sl[z];
+        }
+        if(resident_slot){
+            /* Compute top-1 routed expert: down(silu(gate(x)) * up(x)) * weight */
+            float *rg=falloc(sI),*ru=falloc(sI);
+            matmul_qt(rg,snrm,&resident_slot->g,1);
+            matmul_qt(ru,snrm,&resident_slot->u,1);
+            for(int i=0;i<sI;i++) rg[i]=siluf(rg[i])*ru[i];
+            float *rout=falloc(D);
+            matmul_qt(rout,rg,&resident_slot->d,1);
+            free(rg); free(ru);
+            /* Add weighted routed expert output to shared output */
+            for(int i=0;i<D;i++) sout[i] += top1_w * rout[i];
+            free(rout);
+        }
+        free(snrm);
+        /* Corrected state = h + shared(+top1) */
+        float *hc=falloc(D);
+        for(int i=0;i<D;i++) hc[i]=h[i]+sout[i];
+        free(sout);
+        /* Run L+1's router on corrected state */
+        rmsnorm(nrm,hc,l->post_ln,D,c->eps); free(hc);
+        matmul(ch,nrm,l->router,1,D,E);
+        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        int *pred=la_pred[2][target];
+        for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
+            for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
+                if(!tk && ch[e]>bv){bv=ch[e];best=e;} }
+            pred[kk]=best; }
+        la_val[2][target]=1; free(nrm); free(ch); return;
+    }
+
+    /* Baseline kinds 0, 1 */
     rmsnorm(nrm,h,l->post_ln,D,c->eps);
     matmul(ch,nrm,l->router,1,D,E);
     for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
@@ -2436,7 +2504,10 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
-    if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
+    if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse){
+        la_predict(m,li+1,x,1);  /* PILOT baseline */
+        la_predict(m,li+1,x,2);  /* two-step + top-1 routed */
+    }
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
@@ -3023,9 +3094,10 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         (long)atomic_load_explicit(&g_pilot_loads,memory_order_relaxed),
         (long)atomic_load_explicit(&g_pilot_drops,memory_order_relaxed), g_pilot_k);
     if(g_looka){
-        const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};
+        const char *nm[4]={"previous token (=SPEC prefetch)","layer input, skip attention",
+            "next layer (PILOT, stale)","next layer (two-step+top1, shared+routed+router)"};
         printf("LOOKAHEAD routing — recall of true experts in predicted top-8:\n");
-        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
+        for(int i=0;i<4;i++) printf("  %-48s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     free(pids); free(all);
@@ -4261,9 +4333,10 @@ int main(int argc, char **argv){
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     if(g_looka){
-        const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};
+        const char *nm[4]={"previous token (=SPEC prefetch)","layer input, skip attention",
+            "next layer (PILOT, stale)","next layer (two-step+top1, shared+routed+router)"};
         printf("LOOKAHEAD routing — recall of true experts in predicted top-8:\n");
-        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
+        for(int i=0;i<4;i++) printf("  %-48s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     if(stats) stats_dump(&m,stats);
