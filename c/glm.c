@@ -867,8 +867,9 @@ static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quant
                           * [2] post-attention del layer L -> routing di L+1 (un residuo MoE e
                           *     un'attention di anticipo: il punto dove il prefetch avrebbe
                           *     un intero giro di disco per lavorare in ombra). */
-static int64_t la_hit[3], la_tot[3];
-static int la_pred[2][130][16]; static signed char la_val[2][130];
+static int64_t la_hit[5], la_tot[5];  /* [0]=prev token, [1]=kind0 same-layer, [2]=kind1 next-layer
+                                       * [3]=COUPLE pair-table, [4]=PILOT+COUPLE ensemble */
+static int la_pred[3][130][16]; static signed char la_val[3][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
@@ -1819,6 +1820,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * una volta sola e moltiplicato per tutte le posizioni che lo usano (pesi letti 1 volta);
  * lo shared expert e' un unico matmul a S righe. Per posizione l'accumulo resta
  * nell'ordine (routed nel loro ordine di union, poi shared). */
+/* Forward decl: la_couple_predict is defined after la_predict but called from moe() */
+static void la_couple_predict(Model *m, int layer, const int *idx, int Ke);
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
@@ -1899,11 +1903,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(m->eroute[layer][z]==idxs[kk]){ la_hit[0]++; break; }
             la_tot[0]+=Ke;
         }
-        for(int kind=0;kind<2;kind++) if(la_val[kind][layer]){   /* [1]/[2] vs predizioni */
+        /* Score all prediction kinds (0=skip-attn, 1=PILOT, 2=COUPLE, 3=ensemble) */
+        for(int kind=0;kind<3;kind++) if(la_val[kind][layer]){
             for(int kk=0;kk<Ke;kk++) for(int z=0;z<K;z++)
                 if(la_pred[kind][layer][z]==idxs[kk]){ la_hit[1+kind]++; break; }
             la_tot[1+kind]+=Ke; la_val[kind][layer]=0;
         }
+        /* Score ensemble (bucket 4) */
+        if(la_val[3][layer]){
+            for(int kk=0;kk<Ke;kk++) for(int z=0;z<K;z++)
+                if(la_pred[3][layer][z]==idxs[kk]){ la_hit[4]++; break; }
+            la_tot[4]+=Ke; la_val[3][layer]=0;
+        }
+        /* Generate COUPLE + ensemble predictions for layer L+1 from the ACTUAL routing */
+        la_couple_predict(m,layer,idxs,Ke);
     }
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
     /* ---- FASE B: union degli expert del batch ---- */
@@ -2197,6 +2210,54 @@ static void la_predict(Model *m, int target, const float *h, int kind){
         pred[kk]=best; }
     la_val[kind][target]=1;
     free(nrm); free(ch);
+}
+
+/* LOOKA COUPLE: predict layer L+1's experts from the ACTUAL routing at layer L
+ * (using the pair-table built by #176). Unlike la_predict (which uses a stale
+ * pre-MoE state), this knows the real routing — but it can only run AFTER moe()
+ * completes, so it can't overlap with L's compute. Measured for recall only.
+ *
+ * Also builds the ensemble (bucket 4): union of PILOT's kind-1 prediction and
+ * COUPLE's prediction, deduped, top-K. */
+static void la_couple_predict(Model *m, int layer, const int *idx, int Ke){
+    Cfg *c=&m->c; int E=c->n_experts, K=c->topk;
+    int lt=layer+1;
+    if(lt>=c->n_layers || !m->L[lt].sparse) return;
+    if(E>512 || !cp_pred) return;
+
+    /* COUPLE prediction: score experts by pair-table co-activation */
+    float sc[512]; memset(sc,0,(size_t)E*sizeof(float));
+    for(int kk=0;kk<Ke;kk++){
+        size_t base=((size_t)(layer*2)*E+idx[kk])*CP_M;
+        for(int j=0;j<CP_M && cp_pred[base+j]>=0;j++)
+            sc[cp_pred[base+j]]+=cp_cnt[base+j];
+    }
+    int *cpred=la_pred[2][lt];  /* kind 2 = COUPLE */
+    for(int kk=0;kk<K;kk++){ int best=-1; float bv=0;
+        for(int e=0;e<E;e++) if(sc[e]>bv){bv=sc[e];best=e;}
+        if(best<0){ cpred[kk]=-1; break; }
+        sc[best]=0; cpred[kk]=best;
+    }
+    la_val[2][lt]=1;
+
+    /* Ensemble (bucket 4): union of PILOT kind-1 (la_pred[1][lt]) and COUPLE
+     * (la_pred[2][lt]), deduped into la_pred[3][lt]) */
+    if(la_val[1][lt]){
+        int *ep=la_pred[3][lt]; int en=0;
+        /* Add all PILOT predictions */
+        for(int kk=0;kk<K;kk++){
+            if(la_pred[1][lt][kk]<0) break;
+            int dup=0; for(int j=0;j<en;j++) if(ep[j]==la_pred[1][lt][kk]){dup=1;break;}
+            if(!dup && en<K) ep[en++]=la_pred[1][lt][kk];
+        }
+        /* Add COUPLE predictions not already in the set */
+        for(int kk=0;kk<K && en<K;kk++){
+            if(cpred[kk]<0) break;
+            int dup=0; for(int j=0;j<en;j++) if(ep[j]==cpred[kk]){dup=1;break;}
+            if(!dup) ep[en++]=cpred[kk];
+        }
+        la_val[3][lt]=1;
+    }
 }
 
 /* PILOTA: prefetch guidato dal router. Predice il top-K del layer L+1 dallo stato
@@ -3023,9 +3084,11 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         (long)atomic_load_explicit(&g_pilot_loads,memory_order_relaxed),
         (long)atomic_load_explicit(&g_pilot_drops,memory_order_relaxed), g_pilot_k);
     if(g_looka){
-        const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};
+        const char *nm[5]={"previous token (=SPEC prefetch)","layer input, skip attention",
+            "next layer (PILOT, stale state)","next layer (COUPLE, actual routing)",
+            "next layer (PILOT+COUPLE ensemble)"};
         printf("LOOKAHEAD routing — recall of true experts in predicted top-8:\n");
-        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
+        for(int i=0;i<5;i++) printf("  %-42s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     free(pids); free(all);
@@ -4261,9 +4324,11 @@ int main(int argc, char **argv){
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     if(g_looka){
-        const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};
+        const char *nm[5]={"previous token (=SPEC prefetch)","layer input, skip attention",
+            "next layer (PILOT, stale state)","next layer (COUPLE, actual routing)",
+            "next layer (PILOT+COUPLE ensemble)"};
         printf("LOOKAHEAD routing — recall of true experts in predicted top-8:\n");
-        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
+        for(int i=0;i<5;i++) printf("  %-42s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     if(stats) stats_dump(&m,stats);
