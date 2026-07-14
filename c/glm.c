@@ -867,8 +867,8 @@ static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quant
                           * [2] post-attention del layer L -> routing di L+1 (un residuo MoE e
                           *     un'attention di anticipo: il punto dove il prefetch avrebbe
                           *     un intero giro di disco per lavorare in ombra). */
-static int64_t la_hit[3], la_tot[3];
-static int la_pred[2][130][16]; static signed char la_val[2][130];
+static int64_t la_hit[4], la_tot[4];  /* [0]=prev, [1]=skip-attn, [2]=PILOT, [3]=two-step */
+static int la_pred[3][130][16]; static signed char la_val[3][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
@@ -1899,7 +1899,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(m->eroute[layer][z]==idxs[kk]){ la_hit[0]++; break; }
             la_tot[0]+=Ke;
         }
-        for(int kind=0;kind<2;kind++) if(la_val[kind][layer]){   /* [1]/[2] vs predizioni */
+        for(int kind=0;kind<3;kind++) if(la_val[kind][layer]){   /* score all prediction kinds */
             for(int kk=0;kk<Ke;kk++) for(int z=0;z<K;z++)
                 if(la_pred[kind][layer][z]==idxs[kk]){ la_hit[1+kind]++; break; }
             la_tot[1+kind]+=Ke; la_val[kind][layer]=0;
@@ -2183,10 +2183,62 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
 
 /* LOOKA: predice il top-K del router del layer `target` dallo stato h (residual stream),
  * usando la STESSA pipeline del routing vero (post_ln -> router -> sigmoid+bias, top-K).
- * kind 0 = stesso layer saltando l'attention, kind 1 = layer successivo. */
+ * kind 0 = stesso layer saltando l'attention
+ * kind 1 = layer successivo (PILOT: stale state, 75.8% recall)
+ * kind 2 = two-step: approximate L's shared expert output, add to state, THEN predict L+1.
+ *   The shared expert is resident (part of dense model), so this adds ~3 small matmuls
+ *   but no disk I/O. The corrected state includes the dominant part of MoE(L) that the
+ *   stale PILOT prediction is missing. */
 static void la_predict(Model *m, int target, const float *h, int kind){
     Cfg *c=&m->c; Layer *l=&m->L[target]; int D=c->hidden, E=c->n_experts, K=c->topk;
     float *nrm=falloc(D), *ch=falloc(E);
+
+    if(kind==2){
+        /* Two-step: h is L's post-attention state (pre-MoE). We want to predict L+1's
+         * routing. The real L+1 router sees h + MoE(L). We approximate MoE(L) by
+         * computing ONLY the shared expert (resident, no disk) on the post_ln-normalized
+         * state, then add it to h before running L+1's router.
+         *
+         * target = L+1, so the layer we need the shared expert from is L = target-1.
+         * But we need to normalize h with L's post_ln (not L+1's), then run L's shared
+         * expert, add to h, then normalize the corrected h with L+1's post_ln for the router. */
+        int src_layer = target - 1;
+        if(src_layer < 0 || src_layer >= c->n_layers || !m->L[src_layer].sparse){
+            la_val[2][target] = 0; free(nrm); free(ch); return;
+        }
+        Layer *sl = &m->L[src_layer];
+        int sI = c->moe_inter * c->n_shared;
+        /* Step 1: normalize h with L's post_ln (what moe() does at line 2440) */
+        float *snrm = falloc(D);
+        rmsnorm(snrm, h, sl->post_ln, D, c->eps);
+        /* Step 2: compute shared expert: down(silu(gate(x)) * up(x)) */
+        float *sg = falloc(sI), *su = falloc(sI);
+        matmul_qt(sg, snrm, &sl->sh_gate, 1);
+        matmul_qt(su, snrm, &sl->sh_up,   1);
+        for(int i=0;i<sI;i++) sg[i] = siluf(sg[i]) * su[i];
+        float *sout = falloc(D);
+        matmul_qt(sout, sg, &sl->sh_down, 1);
+        free(snrm); free(sg); free(su);
+        /* Step 3: corrected state = h + shared_expert_output */
+        float *hc = falloc(D);
+        for(int i=0;i<D;i++) hc[i] = h[i] + sout[i];
+        free(sout);
+        /* Step 4: run L+1's router on the corrected state */
+        rmsnorm(nrm, hc, l->post_ln, D, c->eps);
+        free(hc);
+        matmul(ch, nrm, l->router, 1, D, E);
+        for(int e=0;e<E;e++) ch[e] = sigmoidf(ch[e]) + l->router_bias[e];
+        int *pred = la_pred[2][target];
+        for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
+            for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
+                if(!tk && ch[e]>bv){bv=ch[e];best=e;} }
+            pred[kk]=best; }
+        la_val[2][target]=1;
+        free(nrm); free(ch);
+        return;
+    }
+
+    /* Baseline kinds 0 and 1: pure router on the given state */
     rmsnorm(nrm,h,l->post_ln,D,c->eps);
     matmul(ch,nrm,l->router,1,D,E);
     for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
@@ -2436,7 +2488,10 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
-    if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
+    if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse){
+        la_predict(m,li+1,x,1);  /* baseline: stale-state PILOT */
+        la_predict(m,li+1,x,2);  /* two-step: shared-expert-corrected prediction */
+    }
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
@@ -3023,9 +3078,10 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         (long)atomic_load_explicit(&g_pilot_loads,memory_order_relaxed),
         (long)atomic_load_explicit(&g_pilot_drops,memory_order_relaxed), g_pilot_k);
     if(g_looka){
-        const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};
+        const char *nm[4]={"previous token (=SPEC prefetch)","layer input, skip attention",
+            "next layer (PILOT, stale state)","next layer (two-step, shared+router)"};
         printf("LOOKAHEAD routing — recall of true experts in predicted top-8:\n");
-        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
+        for(int i=0;i<4;i++) printf("  %-42s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     free(pids); free(all);
@@ -4261,9 +4317,10 @@ int main(int argc, char **argv){
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     if(g_looka){
-        const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};
+        const char *nm[4]={"previous token (=SPEC prefetch)","layer input, skip attention",
+            "next layer (PILOT, stale state)","next layer (two-step, shared+router)"};
         printf("LOOKAHEAD routing — recall of true experts in predicted top-8:\n");
-        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
+        for(int i=0;i<4;i++) printf("  %-42s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     if(stats) stats_dump(&m,stats);
