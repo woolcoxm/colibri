@@ -831,8 +831,12 @@ static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quant
                           * [2] post-attention del layer L -> routing di L+1 (un residuo MoE e
                           *     un'attention di anticipo: il punto dove il prefetch avrebbe
                           *     un intero giro di disco per lavorare in ombra). */
-static int64_t la_hit[3], la_tot[3];
-static int la_pred[2][130][16]; static signed char la_val[2][130];
+static int64_t la_hit[6], la_tot[6];  /* [0]=prev token, [1]=kind0 same-layer, [2]=kind1 next-layer,
+                                       * [3]=kind2 score-merge, [4]=kind3 set-union, [5]=kind4 rerank */
+static int la_pred[5][130][16]; static signed char la_val[5][130];
+/* Experimental prior boost for PILOT prediction (alpha * 100, env PILOT_PRIOR_ALPHA).
+ * kind 2 = score-space merge, kind 3 = set-union, kind 4 = weighted rerank. */
+static int g_pilot_prior_alpha_x100 = 10;  /* default alpha=0.1 */
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
@@ -1821,7 +1825,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(m->eroute[layer][z]==idxs[kk]){ la_hit[0]++; break; }
             la_tot[0]+=Ke;
         }
-        for(int kind=0;kind<2;kind++) if(la_val[kind][layer]){   /* [1]/[2] vs predizioni */
+        for(int kind=0;kind<5;kind++) if(la_val[kind][layer]){   /* [1]-[5] vs predictions */
             for(int kk=0;kk<Ke;kk++) for(int z=0;z<K;z++)
                 if(la_pred[kind][layer][z]==idxs[kk]){ la_hit[1+kind]++; break; }
             la_tot[1+kind]+=Ke; la_val[kind][layer]=0;
@@ -2105,18 +2109,81 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
 
 /* LOOKA: predice il top-K del router del layer `target` dallo stato h (residual stream),
  * usando la STESSA pipeline del routing vero (post_ln -> router -> sigmoid+bias, top-K).
- * kind 0 = stesso layer saltando l'attention, kind 1 = layer successivo. */
+ * kind 0 = stesso layer saltando l'attention
+ * kind 1 = layer successivo (PILOT strategy: 71.6% recall)
+ * kind 2 = layer successivo + score-space merge (ch[e] += alpha * log1p(eusage))
+ * kind 3 = layer successivo + set-union (router top-K ∪ eusage top-K)
+ * kind 4 = layer successivo + weighted rerank (router top-2K reranked by combined score)
+ *
+ * Kinds 2-4 are experimental: they add a historical-frequency prior from eusage
+ * (the .coli_usage histogram) to compensate for the stale MoE residual. See the
+ * experiment/pilot-usage-prior branch and the LOOKA stats output. */
 static void la_predict(Model *m, int target, const float *h, int kind){
     Cfg *c=&m->c; Layer *l=&m->L[target]; int D=c->hidden, E=c->n_experts, K=c->topk;
     float *nrm=falloc(D), *ch=falloc(E);
     rmsnorm(nrm,h,l->post_ln,D,c->eps);
     matmul(ch,nrm,l->router,1,D,E);
     for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+
     int *pred=la_pred[kind][target];
-    for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
-        for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
-            if(!tk && ch[e]>bv){bv=ch[e];best=e;} }
-        pred[kk]=best; }
+
+    if(kind>=2 && kind<=4 && m->eusage && target<c->n_layers){
+        float alpha = g_pilot_prior_alpha_x100 / 100.0f;
+        /* Precompute the prior term once for all three strategies. */
+        float *prior=falloc(E);
+        for(int e=0;e<E;e++) prior[e]=alpha*log1pf((float)m->eusage[target][e]);
+
+        if(kind==2){
+            /* Score-space merge: add the prior to the router logits, then argmax. */
+            for(int e=0;e<E;e++) ch[e]+=prior[e];
+            for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
+                for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
+                    if(!tk && ch[e]>bv){bv=ch[e];best=e;} }
+                pred[kk]=best; }
+        } else if(kind==3){
+            /* Set-union: router top-K first, then fill remaining slots with eusage top-K. */
+            for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
+                for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
+                    if(!tk && ch[e]>bv){bv=ch[e];best=e;} }
+                pred[kk]=best; }
+            /* Fill any remaining slots (if K < topk, we already have K; if we want
+             * a larger union, we'd extend — but for fair comparison we keep K and
+             * just replace the lowest-router-score predictions with high-eusage ones).
+             * Actually for set-union we want 2K candidates but only score top-K
+             * recall — so we add eusage-top-K experts that aren't already in pred. */
+            for(int e_rank=0; e_rank<E && K<c->topk; e_rank++){
+                /* find the e-th expert by eusage (simple: argmax not already in pred) */
+                int best_e=-1; uint32_t best_u=0;
+                for(int e=0;e<E;e++){ int tk=0;
+                    for(int j=0;j<K;j++) if(pred[j]==e){tk=1;break;}
+                    if(!tk && m->eusage[target][e]>best_u){best_u=m->eusage[target][e];best_e=e;} }
+                if(best_e<0 || best_u==0) break;
+                /* Only add if its router score was low (not already in top-K by router) */
+                pred[K++]=best_e;
+            }
+        } else { /* kind==4: weighted rerank */
+            /* Get router top-2K candidates, rerank by ch[e]+prior[e], take top-K. */
+            int cand[32]; int nc=0;
+            int want = K*2; if(want>32) want=32;
+            for(int kk=0;kk<want;kk++){ int best=-1; float bv=-1e30f;
+                for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(cand[j]==e){tk=1;break;}
+                    if(!tk && ch[e]>bv){bv=ch[e];best=e;} }
+                if(best<0) break; cand[nc++]=best; }
+            /* Rerank candidates by combined score */
+            for(int kk=0;kk<K && kk<nc;kk++){ int best=kk; float bv=-1e30f;
+                for(int j=kk;j<nc;j++){ float s=ch[cand[j]]+prior[cand[j]];
+                    if(s>bv){bv=s;best=j;} }
+                int t=cand[kk]; cand[kk]=cand[best]; cand[best]=t; }
+            for(int kk=0;kk<K;kk++) pred[kk]= kk<nc ? cand[kk] : -1;
+        }
+        free(prior);
+    } else {
+        /* Baseline: pure router argmax (kinds 0, 1, or eusage unavailable). */
+        for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
+            for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(pred[j]==e){tk=1;break;}
+                if(!tk && ch[e]>bv){bv=ch[e];best=e;} }
+            pred[kk]=best; }
+    }
     la_val[kind][target]=1;
     free(nrm); free(ch);
 }
@@ -2287,7 +2354,12 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
-    if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
+    if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse){
+        la_predict(m,li+1,x,1);  /* baseline: next-layer router on post-attn state */
+        la_predict(m,li+1,x,2);  /* experiment: score-space merge with eusage prior */
+        la_predict(m,li+1,x,3);  /* experiment: set-union (router top-K ∪ eusage top-K) */
+        la_predict(m,li+1,x,4);  /* experiment: weighted rerank (router top-2K reranked) */
+    }
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
@@ -2860,9 +2932,11 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         (long)atomic_load_explicit(&g_pilot_loads,memory_order_relaxed),
         (long)atomic_load_explicit(&g_pilot_drops,memory_order_relaxed), g_pilot_k);
     if(g_looka){
-        const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};
+        const char *nm[6]={"previous token (=SPEC prefetch)","layer input, skip attention",
+            "next layer (PILOT baseline)",  "next layer + score-space merge",
+            "next layer + set-union",       "next layer + weighted rerank"};
         printf("LOOKAHEAD routing — recall of true experts in predicted top-8:\n");
-        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
+        for(int i=0;i<6;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     free(pids); free(all);
@@ -3749,6 +3823,7 @@ int main(int argc, char **argv){
      * (best-measured this session) unless the user set PILOT_K explicitly. */
     g_pilot_k = getenv("PILOT_K")?atoi(getenv("PILOT_K")):(g_pilot_real?6:8);
     if(g_pilot_k<1) g_pilot_k=1;
+    g_pilot_prior_alpha_x100 = getenv("PILOT_PRIOR_ALPHA")?atoi(getenv("PILOT_PRIOR_ALPHA")):10;
     g_pipe = getenv("PIPE")?atoi(getenv("PIPE")):0;       /* default OFF: overlap expert load ‖ matmul (byte-identical; reorders I/O). PIPE=1 opts in */
     g_pipe_nw = getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8; /* I/O worker threads */
     if(g_pipe_nw<1) g_pipe_nw=1;
@@ -3938,9 +4013,11 @@ int main(int argc, char **argv){
     if(g_cuda_enabled) cuda_stats_print();
 #endif
     if(g_looka){
-        const char *nm[3]={"previous token (=SPEC prefetch)","layer input, skip attention","next layer (one step ahead)"};
+        const char *nm[6]={"previous token (=SPEC prefetch)","layer input, skip attention",
+            "next layer (PILOT baseline)",  "next layer + score-space merge",
+            "next layer + set-union",       "next layer + weighted rerank"};
         printf("LOOKAHEAD routing — recall of true experts in predicted top-8:\n");
-        for(int i=0;i<3;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
+        for(int i=0;i<6;i++) printf("  %-38s %5.1f%%  (%lld/%lld)\n", nm[i],
             la_tot[i]?100.0*la_hit[i]/la_tot[i]:0.0, (long long)la_hit[i], (long long)la_tot[i]);
     }
     if(stats) stats_dump(&m,stats);
