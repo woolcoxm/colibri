@@ -214,8 +214,56 @@ def dequant(f, name, keys):
         return (w * sc).numpy()
     return f.get_tensor(name).to(torch.float32).numpy()
 
+def load_expert_frequency(usage_path, n_layers, n_experts, top_n=None):
+    """Load the .coli_usage expert frequency histogram. Format (text, one per line):
+        layer expert count
+    e.g. "3 0 155" means layer 3, expert 0, was selected 155 times.
+
+    Returns a dict: {(layer, expert): count}. Used by int2 cold-expert quantization:
+    hot experts (top frequency) stay int4, cold experts go int2.
+
+    If the file doesn't exist, returns an empty dict (all experts treated as hot)."""
+    if not os.path.exists(usage_path):
+        return {}
+    freq = {}
+    with open(usage_path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    layer, expert, count = int(parts[0]), int(parts[1]), int(parts[2])
+                    freq[(layer, expert)] = count
+                except ValueError:
+                    pass
+    return freq
+
+def expert_bits_for(layer, expert, freq, n_layers, n_experts, hot_bits=4, cold_bits=2, hot_frac=0.3):
+    """Decide quantization bits for a specific expert based on its frequency.
+    Hot experts (top hot_frac of frequency) get hot_bits; the rest get cold_bits.
+
+    This enables int2 cold-expert quantization: rarely-used experts are quantized
+    to 2 bits (half the disk I/O and compute per miss), while frequently-used
+    experts stay at 4 bits for quality."""
+    if not freq:
+        return hot_bits  # no frequency data: treat all as hot
+    # Build per-layer frequency ranking
+    layer_freqs = {}
+    for (l, e), count in freq.items():
+        if l == layer:
+            layer_freqs[e] = count
+    if expert not in layer_freqs:
+        return cold_bits  # never seen: definitely cold
+    # Rank this expert within its layer
+    sorted_experts = sorted(layer_freqs.values(), reverse=True)
+    rank = sorted_experts.index(layer_freqs[expert])
+    threshold = max(1, int(len(sorted_experts) * hot_frac))
+    if rank < threshold:
+        return hot_bits
+    return cold_bits
+
 def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
-                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
+                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None,
+                  expert_freq=None, cold_xbits=None):
     from safetensors import safe_open
     with safe_open(path, framework="pt") as f:
         keys = set(f.keys())
@@ -230,6 +278,19 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                 # otherwise fall back to the classic ebits/xbits/io_bits scheme.
                 if bits_map and kind in bits_map:
                     bits = bits_map[kind]
+                elif kind == "x" and expert_freq is not None and cold_xbits is not None:
+                    # Per-expert mixed precision: hot experts at xbits, cold at cold_xbits.
+                    # Parse layer and expert id from tensor name:
+                    #   model.layers.{layer}.mlp.experts.{expert}.{proj}.weight
+                    parts = name.split(".")
+                    try:
+                        li_x = int(parts[2]); ei_x = int(parts[5])
+                        bits = expert_bits_for(li_x, ei_x, expert_freq, n_layers, 256,
+                                               hot_bits=xbits, cold_bits=cold_xbits)
+                        if bits != xbits:
+                            pass  # could log per-expert bit assignment here
+                    except (ValueError, IndexError):
+                        bits = xbits  # can't parse: default
                 else:
                     bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
                 # Any unknown kind that fell through classify as "q"
@@ -269,6 +330,13 @@ def main():
         help="bits for dense MLP (first 3 layers). Default=ebits")
     ap.add_argument("--group-size", type=int, default=0,  # 0 = per-row (backward compat); 128 = group-scaled
         help="group size for int4 scales: 0=per-row (default), 128=one scale per 128 elements (much better quality)")
+    ap.add_argument("--cold-xbits", type=int, default=None,
+        help="bits for COLD (rarely-used) routed experts. Set to 2 for int2 cold experts "
+             "(halves disk I/O + compute for misses on rarely-used experts). "
+             "Requires --usage-file. Hot experts stay at --xbits (default 4).")
+    ap.add_argument("--usage-file", type=str, default=None,
+        help="path to .coli_usage expert frequency file (from engine STATS). Used with "
+             "--cold-xbits to decide which experts are hot vs cold.")
     ap.add_argument("--n-layers", type=int, default=78)
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--selftest", action="store_true")
@@ -298,6 +366,21 @@ def main():
     if a.dmlp_bits is not None:   bits_map["dmlp"] = a.dmlp_bits
     if bits_map:
         print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
+
+    # Load expert frequency for cold-expert quantization (int2 cold / int4 hot)
+    expert_freq = None
+    if a.cold_xbits is not None:
+        usage = a.usage_file or os.path.join(a.outdir, ".coli_usage")
+        expert_freq = load_expert_frequency(usage, a.n_layers, 256)
+        if expert_freq:
+            total = sum(expert_freq.values())
+            n_hot = sum(1 for v in expert_freq.values() if v > total / (len(expert_freq) * 3))
+            print(f"[COLD] expert frequency loaded: {len(expert_freq)} entries, "
+                  f"{total} total selections, ~{n_hot} hot experts "
+                  f"(will quantize at {a.xbits}bit), rest at {a.cold_xbits}bit")
+        else:
+            print(f"[COLD] WARNING: no frequency data at {usage}, all experts will use {a.xbits}bit")
+            a.cold_xbits = None  # disable: no data to split on
 
     if a.selftest_nvfp4:
         import torch
@@ -380,7 +463,9 @@ def main():
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         from safetensors.numpy import save_file
         for i, sp in enumerate(shards):
-            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
+            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
+                                    group_size=a.group_size, bits_map=bits_map,
+                                    expert_freq=expert_freq, cold_xbits=a.cold_xbits)
             save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
         # copia config + tokenizer
         for fn in ["config.json"]:
@@ -657,7 +742,9 @@ def main():
         if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
         print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
-        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
+        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
+                                group_size=a.group_size, bits_map=bits_map,
+                                expert_freq=expert_freq, cold_xbits=a.cold_xbits)
         save_file(out, outp)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
