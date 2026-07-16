@@ -93,7 +93,10 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
 
 /* Scale lookup: per-row for fmt 1/2/3, per-group for fmt=4.
  * gs<=1 means per-row (one scale per output row o).
- * gs>1 means grouped (ng scales per row, indexed by input position i). */
+ * gs>1 means grouped (ng scales per row, indexed by input position i).
+ * For gs that is a power of 2 (e.g. 64=2^6), the compiler converts i/gs
+ * to a right shift. For non-power-of-2 gs, consider precomputing a lookup
+ * table — but gs=64 is the default and is power-of-2, so this is fast. */
 __device__ static float scale_at(const float *scales, int fmt, int gs, int ng, int o, int i) {
     if (fmt == 0) return 1.0f;
     if (gs <= 1 || ng <= 0) return scales[o];
@@ -331,9 +334,12 @@ __global__ static void attention_absorb_kernel(float *ctx,const float *q,const f
 
 __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         const float *latent,const float *rope,const void *weights,const float *wscale,
-        int fmt,int gs,int ng,int S,int H,int Q,int R,int V,int K,int T,float scale){
-    int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
-    if(s>=S||nt<1)return;
+        int fmt,int gs,int ng,int S,int H,int Q,int R,int V,int K,int T,float scale,
+        int s_offset){
+    int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x;
+    int global_s = s + s_offset;
+    int nt=T-S+global_s+1,rbase=h*(Q+V);
+    if(nt<1)return;
     extern __shared__ float sm[];float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+T;
     const float *qs=q+((size_t)s*H+h)*(Q+R);
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
@@ -546,10 +552,20 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
-    dim3 grid((unsigned)O, (unsigned)S);
-    quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, t->gs, t->ng, S, I, O, rb);
-    if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
-        !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+    /* Chunk over S in batches of 32 to keep each kernel launch under the GPU
+     * TDR timeout (~2s). Each chunk: dim3(O, 32) blocks = manageable work.
+     * Without this, S=401 launches dim3(O,401) which trips TDR on sm_120. */
+    const int CHUNK = 32;
+    for (int s0 = 0; s0 < S; s0 += CHUNK) {
+        int sc = (S - s0 < CHUNK) ? S - s0 : CHUNK;
+        dim3 grid((unsigned)O, (unsigned)sc);
+        quant_matmul<<<grid, 256>>>((float*)((char*)ctx->y + (size_t)s0 * O * sizeof(float)),
+            (const float*)((const char*)ctx->x + (size_t)s0 * I * sizeof(float)),
+            t->weights, t->scales, fmt, t->gs, t->ng, sc, I, O, rb);
+        if (!cuda_ok(cudaGetLastError(), "matmul launch")) return 0;
+        if (!cuda_ok(cudaStreamSynchronize(ctx->stream), "matmul chunk sync")) return 0;
+    }
+    if (!cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
 }
 
@@ -775,15 +791,38 @@ static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,flo
        !cuda_ok(cudaMemcpyAsync(dc->al,latent,lb,cudaMemcpyHostToDevice,dc->stream),"attention batch latent upload")||
        !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention batch rope upload"))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
-    attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,
-        dc->ar,w->weights,w->scales,w->fmt,w->gs,w->ng,S,H,Q,R,V,K,T,scale);
-    if(!cuda_ok(cudaGetLastError(),"attention batch launch"))return 0;
+    /* Chunk over S in batches of 32: each kernel launch is dim3(H, min(32,remaining))
+     * blocks, keeping per-launch GPU time under the TDR timeout. At S=401 without
+     * chunking, the attention kernel does O(S*T*K) = 401*401*512 work per head-block,
+     * taking >2s and tripping the GPU driver timeout (0x116 system freeze on sm_120). */
+    const int CHUNK=32;
+    for(int s0=0;s0<S;s0+=CHUNK){
+        int sc=(S-s0<CHUNK)?S-s0:CHUNK;
+        /* the kernel computes nt=T-S+s+1 per-row; pass S and T as-is so each chunk's
+         * rows get the right causal window. The output offset is s0*H*V. */
+        attention_absorb_batch_kernel<<<dim3(H,sc),256,shared,dc->stream>>>(
+            dc->ac+(size_t)s0*H*V,
+            (const float*)((const char*)dc->aq+(size_t)s0*H*(Q+R)*sizeof(float)),
+            dc->al,dc->ar,w->weights,w->scales,w->fmt,w->gs,w->ng,
+            S,H,Q,R,V,K,T,scale,s0);
+        if(!cuda_ok(cudaGetLastError(),"attention batch launch"))return 0;
+        if(!cuda_ok(cudaStreamSynchronize(dc->stream),"attention batch chunk sync"))return 0;
+    }
     const float *src=dc->ac;size_t ob=cb;
     if(proj){
         ob=(size_t)S*proj->O*sizeof(float);if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
-        quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
-            proj->scales,proj->fmt,proj->gs,proj->ng,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
-        if(!cuda_ok(cudaGetLastError(),"attention o_proj launch"))return 0;src=dc->y;
+        /* chunk the o_proj matmul too */
+        for(int s0=0;s0<S;s0+=CHUNK){
+            int sc=(S-s0<CHUNK)?S-s0:CHUNK;
+            quant_matmul<<<dim3(proj->O,sc),256,0,dc->stream>>>(
+                (float*)((char*)dc->y+(size_t)s0*proj->O*sizeof(float)),
+                (const float*)((const char*)dc->ac+(size_t)s0*H*V*sizeof(float)),
+                proj->weights,proj->scales,proj->fmt,proj->gs,proj->ng,
+                sc,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+            if(!cuda_ok(cudaGetLastError(),"attention o_proj launch"))return 0;
+            if(!cuda_ok(cudaStreamSynchronize(dc->stream),"o_proj chunk sync"))return 0;
+        }
+        src=dc->y;
     }
     if(!cuda_ok(cudaMemcpyAsync(out,src,ob,cudaMemcpyDeviceToHost,dc->stream),
                                proj?"attention projected output download":"attention batch context download")||
@@ -951,7 +990,7 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
     if(!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,w->gs,w->ng,S,H,Q,R,V,K,T,scale);
+        rope_dev,w->weights,w->scales,w->fmt,w->gs,w->ng,S,H,Q,R,V,K,T,scale,0);
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch"))return 0;
     size_t ob=(size_t)S*proj->O*sizeof(float);
     if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
@@ -1010,7 +1049,7 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
     if(!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,w->gs,w->ng,S,H,Q,R,V,K,T,scale);
+        rope_dev,w->weights,w->scales,w->fmt,w->gs,w->ng,S,H,Q,R,V,K,T,scale,0);
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch (dev out)"))return 0;
     quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(out_dev,dc->ac,proj->weights,
         proj->scales,proj->fmt,proj->gs,proj->ng,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
@@ -1028,7 +1067,7 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(ctx_dev,q_dev,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,w->gs,w->ng,S,H,Q,R,V,K,T,scale);
+        rope_dev,w->weights,w->scales,w->fmt,w->gs,w->ng,S,H,Q,R,V,K,T,scale,0);
     if(!cuda_ok(cudaGetLastError(),"pipe shard attention launch"))return 0;
     return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe shard attention sync");
 }
@@ -1045,7 +1084,7 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"kvdev q upload"))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,1),256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,w->gs,w->ng,1,H,Q,R,V,K,T,scale);
+        rope_dev,w->weights,w->scales,w->fmt,w->gs,w->ng,1,H,Q,R,V,K,T,scale,0);
     if(!cuda_ok(cudaGetLastError(),"kvdev absorb launch")||
        !cuda_ok(cudaMemcpyAsync(ctx,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"kvdev ctx download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"kvdev absorb sync"))return 0;
