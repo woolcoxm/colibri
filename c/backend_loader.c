@@ -46,6 +46,8 @@ typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, 
                                               int R, int V, int K, int T, float attention_scale);
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
                                            const float *scales, int fmt, int I, int O, int device);
+typedef int            (*fn_tensor_upload_grouped)(ColiCudaTensor **tensor, const void *weights,
+                                           const float *scales, int fmt, int I, int O, int device, int gs);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device);
@@ -98,6 +100,7 @@ static struct {
     fn_expert_group    expert_group;
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
+    fn_tensor_upload_grouped tensor_upload_grouped;
     fn_matmul          matmul;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
@@ -191,6 +194,7 @@ static int coli_cuda_load(void){
     RESOLVE(expert_group,   fn_expert_group)
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
+    RESOLVE(tensor_upload_grouped, fn_tensor_upload_grouped)
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
@@ -294,6 +298,11 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,
                             const float *scales, int fmt, int I, int O, int device){
     if(!g_cuda.available) return 0;
     return g_cuda.tensor_upload(tensor, weights, scales, fmt, I, O, device);
+}
+int coli_cuda_tensor_upload_grouped(ColiCudaTensor **tensor, const void *weights,
+                                     const float *scales, int fmt, int I, int O, int device, int gs){
+    if(!g_cuda.available) return 0;
+    return g_cuda.tensor_upload_grouped(tensor, weights, scales, fmt, I, O, device, gs);
 }
 
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,

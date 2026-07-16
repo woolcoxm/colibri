@@ -38,6 +38,11 @@ COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *expert
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
+/* Same as above but with explicit group size (gs) for fmt=4 grouped int4.
+ * gs=0 means per-row scales (same as the original upload). */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_grouped(ColiCudaTensor **tensor,
+                            const void *weights, const float *scales,
+                            int fmt, int I, int O, int device, int gs);
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.

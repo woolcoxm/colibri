@@ -231,6 +231,7 @@ static void qt_cuda_reset(QT *t){
 static int qt_cuda_upload(QT *t){
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+    if(t->fmt==4) return coli_cuda_tensor_upload_grouped(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device,t->gs);
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
 static int qt_cuda_update(QT *t){
