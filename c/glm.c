@@ -2801,7 +2801,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         } else {
             /* top-K via taken-flag: O(K×E) instead of O(K²×E) — the old version
              * re-scanned idx[0..kk) for every expert e to check "already taken";
-             * a flag array makes that O(1). With K=8,E=256 that's 8× fewer
+             * a flag array makes it O(1). With K=8,E=256 that's 8× fewer
              * comparisons in the selection loop (#292 "other" breakdown). */
             char taken[256]; memset(taken,0,(size_t)E);   /* E<=256 */
             for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
@@ -4352,6 +4352,13 @@ static void run_score(Model *m, const char *snap, const char *path){
             ids[0]=pfx[0]; ids[1]=pfx[1]; ctxlen+=2; T+=2;
         }
         for(int s=0;s<T;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+#ifdef COLI_CUDA
+        /* Reset the VRAM KV shadow between requests: each score request is an
+         * independent sequence, but kv_dev_valid[] persists from the previous
+         * request. Without this reset the CUDA attention path reads stale VRAM
+         * KV rows -> NaN router logits -> expert -1 crash (#292 eval). */
+        if(m->kv_dev_valid) memset(m->kv_dev_valid,0,(size_t)(c->n_layers+1)*sizeof(int));
+#endif
         layers_forward(m,x,T,0);
         double lp=0; int greedy=1;
         for(int pos=ctxlen-1; pos<T-1; pos++){
