@@ -993,7 +993,10 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
      * Streaming expert slots are reused for different IDs and must never enter
      * this cache. Nested OpenMP calls stay on CPU because each device context
      * intentionally owns one synchronous scratch stream in this stage. */
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
+    /* fmt=4 CUDA support is implemented but causes system instability on sm_120.
+     * See PR #298 for details. Keep fmt=4 on CPU (matmul_i4_grouped) until the
+     * CUDA driver stability issue is resolved. */
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=4 && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
