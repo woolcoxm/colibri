@@ -2869,8 +2869,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
      * only drop from misses. From the misses, keep the highest-aggregate-gate-weight
      * ones up to the budget; drop the rest from idxs[] so they're never loaded.
      * (MoE-Spec arXiv 2602.16052: top-32 of 64 capture 93% routing weight.)
-     * Complementary to TOPP (per-position) — this trims cross-position. */
-    if(g_expert_budget>0 && nu>g_expert_budget){
+     * Complementary to TOPP (per-position) — this trims cross-position.
+     *
+     * DECODE ONLY (S<=4): during prefill (S>=8) many positions route to different
+     * experts, so nu can be 30-100+. Dropping experts there corrupts the prefill
+     * hidden state → garbage decode output. The budget must only trim during
+     * single-token decode where nu is small and each expert's contribution matters. */
+    if(g_expert_budget>0 && S<=4 && nu>g_expert_budget){
         /* compute aggregate gate weight per unique expert */
         float *wsum=falloc(nu); for(int j=0;j<nu;j++) wsum[j]=0;
         for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
